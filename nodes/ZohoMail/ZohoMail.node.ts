@@ -36,14 +36,14 @@ async function refreshZohoToken(
 
     const fullUrl = `${accessTokenUrl}?${queryParams.toString()}`;
 
-    const options: IRequestOptions = {
-        method: 'POST',
-        uri: fullUrl,
-        json: true,
-    };
-
     try {
-        const response = await this.helpers.request(options);
+        const response = await this.helpers.httpRequest({
+            method: 'POST',
+            url: fullUrl,
+            headers: {
+                'Content-Type': 'application/json',
+            },
+        });
         
         if (!response || !response.access_token) {
             throw new Error('Invalid response from Zoho API');
@@ -81,50 +81,60 @@ async function zohoApiRequest(
     const dataCenter = credentials.dataCenter as string || 'com';
     const baseUrl = `https://mail.zoho.${dataCenter}`;
 
-    const options: IRequestOptions = {
-        method,
-        uri: uri || `${baseUrl}${endpoint}`,
-        qs,
-        headers: {
-            'Accept': 'application/json',
-            'Authorization': `Zoho-oauthtoken ${(credentials.oauthTokenData as IDataObject).access_token}`,
-        },
-        json: true,
-        ...(Object.keys(body).length > 0 && { body }),
-    };
-
     try {
-        const responseData = await this.helpers.request(options);
+        const responseData = await this.helpers.httpRequest({
+            method,
+            url: uri || `${baseUrl}${endpoint}`,
+            qs,
+            headers: {
+                'Accept': 'application/json',
+                'Authorization': `Zoho-oauthtoken ${(credentials.oauthTokenData as IDataObject).access_token}`,
+            },
+            body: Object.keys(body).length > 0 ? body : undefined,
+        });
         return responseData;
     } catch (error) {
-        // Provjeri je li greška 404 s INVALID_OAUTHTOKEN
-        if (error.statusCode === 404 && 
-            error.error.data.errorCode === 'INVALID_OAUTHTOKEN') {
+        // Log the full error details
+        console.error('Zoho API Request Error, will try to refresh token...');
+
+        // Check if error is 404 with INVALID_OAUTHTOKEN
+        if (error.response.status === 404 && error.response?.data?.data?.errorCode === 'INVALID_OAUTHTOKEN') {
             try {
-                // Osvježi token
+                console.log('Refreshing token...');
+                // Refresh token
                 const newTokenData = await refreshZohoToken.call(this, credentials);
                 
-                // Ažuriraj kredencijale s novim tokenom
+                // Update credentials with new token
                 credentials.oauthTokenData = {
                     access_token: newTokenData.access_token,
                     expires_in: newTokenData.expires_in,
                     expires_at: Date.now() + (newTokenData.expires_in * 1000)
                 };
                 
-                // Ponovi originalni zahtjev s novim tokenom
-                options.headers = {
-                    ...options.headers,
-                    'Authorization': `Zoho-oauthtoken ${newTokenData.access_token}`,
-                };
-                
-                return await this.helpers.request(options);
+                // Retry original request with new token
+                return await this.helpers.httpRequest({
+                    method,
+                    url: uri || `${baseUrl}${endpoint}`,
+                    qs,
+                    headers: {
+                        'Accept': 'application/json',
+                        'Authorization': `Zoho-oauthtoken ${newTokenData.access_token}`,
+                    },
+                    body: Object.keys(body).length > 0 ? body : undefined,
+                });
             } catch (refreshError) {
-                console.error('Greška pri osvježavanju tokena:', refreshError);
-                throw refreshError;
+                console.error('Error refreshing token:', refreshError);
+                throw new Error(`Failed to refresh token: ${refreshError.message}`);
             }
         }
 
-        throw error;
+        // If it's a 404 but not an INVALID_OAUTHTOKEN error
+        if (error.statusCode === 404) {
+            throw new Error(`Resource not found at endpoint: ${endpoint}. Please check if the endpoint is correct and the resource exists.`);
+        }
+
+        // For other errors, throw with more context
+        throw new Error(`Zoho API request failed: ${error.message}`);
     }
 }
 
@@ -499,51 +509,32 @@ export class ZohoMail implements INodeType {
                 const body: IDataObject = {};
                 const qs: IDataObject = {};
 
-                let accountId = '';
-                // Get accountId if needed for resource/operation
-                if (['message', 'folder'].includes(resource) || (resource === 'account' && operation === 'get')) {
-                    try {
-                        accountId = this.getNodeParameter('accountId', i) as string;
-                        if (!accountId) {
-                             throw new Error(`Account ID is required for resource '${resource}' and operation '${operation}'.`);
-                        }
-                    } catch (error) {
-                         // Error if Account ID is not found or not set
-                         throw new Error(`Cannot get Account ID: ${error.message}`);
-                    }
-                }
-
                 // --- Define Endpoints, Methods, Body and QS ---
                 if (resource === 'message') {
                     if (operation === 'get') {
-                        const folderId = this.getNodeParameter('folderId', i) as string;
-                        const messageId = this.getNodeParameter('messageId', i) as string;
-                        if (!folderId || !messageId) throw new Error('Folder ID and Message ID are required for fetching message.');
                         method = 'GET';
-                        endpoint = `/api/accounts/${accountId}/folders/${folderId}/messages/${messageId}/content`; // or just /messages/{messageId} depending on API
+                        endpoint = '/api/accounts/{accountId}/folders/{folderId}/messages/{messageId}/content';
                     } else if (operation === 'getMany') {
-                        endpoint = `/api/accounts/${accountId}/messages/view`; // Check exact endpoint for message view
+                        endpoint = '/api/accounts/{accountId}/messages/view';
                         method = 'GET';
                         const returnAll = this.getNodeParameter('returnAll', i, false) as boolean;
                         const additionalFields = this.getNodeParameter('additionalFields', i, {}) as IDataObject;
 
                         // Query parameters for filtering and pagination
-                         qs.limit = returnAll ? 100 : (this.getNodeParameter('limit', i, 50) as number); // Set default limit, Zoho max is often 100
-                         qs.start = 1; // Start from first page
+                        qs.limit = returnAll ? 100 : (this.getNodeParameter('limit', i, 50) as number);
+                        qs.start = 1;
 
-                         // Apply filters from additionalFields
-                         if (additionalFields.folderId) qs.folderId = additionalFields.folderId;
-                         if (additionalFields.status) qs.status = additionalFields.status;
-                         if (additionalFields.from) qs.from = additionalFields.from;
-                         if (additionalFields.to) qs.to = additionalFields.to;
-                         if (additionalFields.subject) qs.subject = additionalFields.subject;
-                         if (additionalFields.content) qs.content = additionalFields.content;
-                         if (additionalFields.sortby) qs.sortby = additionalFields.sortby;
-                         if (additionalFields.sortorder) qs.sortorder = additionalFields.sortorder;
-                         // Add other parameters...
-
+                        // Apply filters from additionalFields
+                        if (additionalFields.folderId) qs.folderId = additionalFields.folderId;
+                        if (additionalFields.status) qs.status = additionalFields.status;
+                        if (additionalFields.from) qs.from = additionalFields.from;
+                        if (additionalFields.to) qs.to = additionalFields.to;
+                        if (additionalFields.subject) qs.subject = additionalFields.subject;
+                        if (additionalFields.content) qs.content = additionalFields.content;
+                        if (additionalFields.sortby) qs.sortby = additionalFields.sortby;
+                        if (additionalFields.sortorder) qs.sortorder = additionalFields.sortorder;
                     } else if (operation === 'send' || operation === 'saveDraft') {
-                        endpoint = `/api/accounts/${accountId}/messages`;
+                        endpoint = '/api/accounts/{accountId}/messages';
                         method = 'POST';
                         const fromAddress = this.getNodeParameter('fromAddress', i) as string;
                         const toEmail = this.getNodeParameter('toEmail', i) as string;
@@ -554,42 +545,74 @@ export class ZohoMail implements INodeType {
                         if (!fromAddress || !toEmail) throw new Error('From and To addresses are required.');
 
                         body.fromAddress = fromAddress;
-                        body.toAddress = toEmail; // Zoho API usually supports comma-separated addresses
+                        body.toAddress = toEmail;
                         body.subject = subject;
                         body.content = content;
-                        body.mailFormat = additionalFields.mailFormat || 'html'; // Default to HTML
+                        body.mailFormat = additionalFields.mailFormat || 'html';
 
-                        if (operation === 'saveDraft') body.mode = 'draft'; // Check exact parameter for saving draft
+                        if (operation === 'saveDraft') body.mode = 'draft';
                         if (additionalFields.ccEmail) body.ccAddress = additionalFields.ccEmail;
                         if (additionalFields.bccEmail) body.bccAddress = additionalFields.bccEmail;
-                        if (additionalFields.fromName) body.fromName = additionalFields.fromName; // Check if API supports 'fromName' or goes in fromAddress (e.g. "Name <email@domain.com>")
+                        if (additionalFields.fromName) body.fromName = additionalFields.fromName;
                     }
                 } else if (resource === 'folder') {
                     if (operation === 'get') {
-                        const folderId = this.getNodeParameter('folderId', i) as string;
-                        if (!folderId) throw new Error('Folder ID is required for fetching folder.');
-                        endpoint = `/api/accounts/${accountId}/folders/${folderId}`;
+                        endpoint = '/api/accounts/{accountId}/folders/{folderId}';
                         method = 'GET';
                     } else if (operation === 'getMany') {
-                        endpoint = `/api/accounts/${accountId}/folders`;
+                        endpoint = '/api/accounts/{accountId}/folders';
                         method = 'GET';
-                        // Add QS parameters for folders if they exist (e.g. parentFolderId)
                     }
                 } else if (resource === 'account') {
                     if (operation === 'get') {
-                        // accountId is already fetched at the start of the loop
-                        endpoint = `/api/accounts/${accountId}`;
+                        endpoint = '/api/accounts/{accountId}';
                         method = 'GET';
                     } else if (operation === 'getAll') {
                         endpoint = '/api/accounts';
                         method = 'GET';
                     }
                 }
-                 // --- End of definition ---
 
                 if (!endpoint || !method) {
                     throw new Error(`Unsupported combination of resource '${resource}' and operation '${operation}'.`);
                 }
+
+                // Get accountId if needed
+                let accountId = '';
+                if (endpoint.includes('{accountId}')) {
+                    accountId = this.getNodeParameter('accountId', i) as string;
+                    if (!accountId) {
+                        throw new Error('Account ID is required for this operation.');
+                    }
+                    endpoint = endpoint.replace('{accountId}', accountId);
+                }
+
+                // Get folderId if needed
+                if (endpoint.includes('{folderId}')) {
+                    const folderId = this.getNodeParameter('folderId', i) as string;
+                    if (!folderId) {
+                        throw new Error('Folder ID is required for this operation.');
+                    }
+                    endpoint = endpoint.replace('{folderId}', folderId);
+                }
+
+                // Get messageId if needed
+                if (endpoint.includes('{messageId}')) {
+                    const messageId = this.getNodeParameter('messageId', i) as string;
+                    if (!messageId) {
+                        throw new Error('Message ID is required for this operation.');
+                    }
+                    endpoint = endpoint.replace('{messageId}', messageId);
+                }
+
+                // Log the request details for debugging
+                console.log('Making Zoho API request:', {
+                    resource,
+                    operation,
+                    accountId,
+                    endpoint,
+                    method
+                });
 
                 // Use zohoApiRequest instead of direct call
                 const responseData = await zohoApiRequest.call(
@@ -611,19 +634,22 @@ export class ZohoMail implements INodeType {
                 });
 
             } catch (error) {
-                console.error(`Error executing for item ${i}:`, error.message);
-                 if (error.response) {
-                      console.error('   - API Response Status:', error.response.statusCode);
-                      console.error('   - API Response Body:', error.response.body);
-                 }
-                 // If error is related to authentication (e.g. 401), provide more specific message
-                 if (error.statusCode === 401 || (error.message && error.message.toLowerCase().includes('token'))) {
-                      error.message = `Authentication error: ${error.message}. Please check if token is valid or try to reauthorize.`;
-                 }
+                console.error(`Error executing for item ${i}:`, {
+                    message: error.message,
+                    statusCode: error.statusCode,
+                    response: error.response,
+                    resource: this.getNodeParameter('resource', i),
+                    operation: this.getNodeParameter('operation', i),
+                    accountId: this.getNodeParameter('accountId', i)
+                });
 
                 if (this.continueOnFail()) {
                     returnData.push({
-                        json: { error: error.message, details: error.response?.body },
+                        json: { 
+                            error: error.message,
+                            details: error.response?.data || error.response?.body,
+                            statusCode: error.statusCode
+                        },
                         pairedItem: { item: i },
                     });
                     continue;
