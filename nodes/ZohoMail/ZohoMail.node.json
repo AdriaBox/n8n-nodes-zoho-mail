@@ -1,0 +1,21 @@
+{
+	"node": "n8n-nodes-base.zohoMail",
+	"nodeVersion": "1.0",
+	"codexVersion": "1.0",
+	"categories": [
+		"Communication",
+		"Services"
+	],
+	"resources": {
+		"primaryDocumentation": [
+			{
+				"url": "https://www.zoho.com/mail/help/api/"
+			}
+		],
+		"credentialDocumentation": [
+			{
+				"url": "https://www.zoho.com/mail/help/api/using-oauth.html"
+			}
+		]
+	}
+} 
